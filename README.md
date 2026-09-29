@@ -11,6 +11,8 @@
 
 此外，验收策略是**不可变版本化**的：管理员可以当前激活策略为基线创建草稿、做并发安全的原子激活；还提供**影子验签**接口 `/verify-shadow`，按任意历史/草稿策略版本完整执行全部校验，但**绝不写入 `used_nonces`、绝不改变正式验收状态**，并返回相对当前激活版本的逐项差异。
 
+回执生命周期还包括**撤销与时点核验**：管理员可在事务内提交**幂等撤销命令**（按 `receipt_id`，携带原因、`effective_at` 与乐观并发令牌 `expected_revision`），服务锁定回执、拒绝未知或冲突命令，生成**不可变、带全局序号的撤销记录**并以服务端 Ed25519 密钥签名；撤销记录之间以哈希链构成**审计链**，与回执版本号推进在**同一事务**中原子提交，重启与并发下结果一致。任何人都可以按**时点**查询回执状态（`valid` / `revoked` / `unknown`）并获取**签名撤销证明**，离线工具可完整核验回执、历史公钥、撤销证明与审计链（篡改、时间倒流、跨回执复用均会失败）。
+
 验签成功响应中包含密钥版本、SPKI 指纹、逐组件值、完整签名基串（单行与整体）、执行所用策略版本、稳定原因码，以及一份**服务端签名、可离线核验的验收回执**（见下文「验收回执」）。
 
 > 互操作性：本实现重建的签名基串及 Ed25519 签名与 RFC 9421 附录 B.2.6 **逐字节一致**，并能验证附录 B.2.2 的官方 RSA-PSS-SHA512 签名（见 `tests/test_rfc_vectors.py`）。
@@ -361,6 +363,10 @@ curl -sX POST http://localhost:8000/admin/policy/versions/2/activate \
 | `policy_draft_not_activatable` | 激活目标不是草稿（已激活或已退役） |
 | `receipt_unknown` | 按 ID 查询的回执不存在（404） |
 | `receipt_issuance_failed` | 回执签发或持久化失败，验收整体回滚（500，nonce 未被消费，可安全重试） |
+| `revocation_unknown` | 回执存在但未被撤销，查询其撤销记录时返回（404） |
+| `revocation_conflict` | 回执已被**不同**的撤销命令撤销（409，响应携带已生效的撤销记录） |
+| `revocation_revision_conflict` | 撤销命令的 `expected_revision` 与回执当前版本不一致（409） |
+| `revocation_issuance_failed` | 撤销记录签发或持久化失败，命令整体回滚（500，可安全重试） |
 
 ## 验收回执（可离线核验）
 
@@ -421,9 +427,133 @@ python3 tools/verify_receipt.py --receipt receipt.json --keys keys.json --reques
 
 全部通过时退出码为 0 并打印 `OK: receipt <id> verified offline`；任一检查失败退出码为 1。`--receipt` 也接受完整的 `/verify` 响应 JSON（自动提取其中的 `receipt`）。
 
+## 验收回执撤销与时点核验
+
+已签发的回执可以被**撤销**（例如签名密钥泄露、验收策略误判）：管理员提交一条**幂等撤销命令**，服务在**单个数据库事务**内完成全部状态迁移，并产出一份**不可变、带全局序号、服务端 Ed25519 签名的撤销记录**；所有撤销记录按序以哈希链连接，构成可离线核验的**审计链**。
+
+### 提交撤销命令
+
+`POST /admin/receipts/{receipt_id}/revoke`（需要 `X-Admin-Token`）
+
+```json
+{
+  "reason": "signer key compromised",
+  "effective_at": 1790301500,
+  "expected_revision": 0,
+  "command_id": "cmd-2026-09-29-001"
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `reason` | 撤销原因（非空，记入签名载荷） |
+| `effective_at` | 撤销生效时刻：unix 秒整数或 ISO-8601 字符串；可早于当前（追溯）或晚于当前（预约） |
+| `expected_revision` | 乐观并发令牌，必须等于回执当前版本（未撤销过的回执为 `0`） |
+| `command_id` | 可选幂等键；网络重试时携带同一 `command_id` 与相同参数即可安全重发 |
+
+事务内的处理顺序：
+
+1. `SELECT ... FOR UPDATE` **锁定回执行**；`receipt_id` 不存在返回 `404 receipt_unknown`；
+2. 若该回执已有撤销记录：**相同命令**（`command_id` 一致且参数一致；未提供 `command_id` 时全部参数一致）返回原记录（`200`，`idempotent_replay: true`），否则返回 `409 revocation_conflict` 并携带已生效的记录；
+3. `expected_revision` 与回执当前版本不一致时返回 `409 revocation_revision_conflict`（响应含 `current_revision`）；
+4. 在全局 advisory lock 下分配**无间隙全局序号**并读取链头（`UNIQUE(revocation_seq)` 为数据库兜底）；
+5. 原子比较并推进回执版本（`revision: 0 → 1`），构造 `revocation/v1` 规范载荷，用当前回执签名密钥签名，插入不可变记录——**撤销记录、回执版本推进与审计链链接在同一事务提交**，任何失败整体回滚（`500 revocation_issuance_failed`，可安全重试）。
+
+成功响应 `201`（重放为 `200`）：
+
+```json
+{
+  "status": "revoked",
+  "receipt_id": "d56b60a2-078c-4443-8863-8ad2f05643db",
+  "idempotent_replay": false,
+  "revocation": {
+    "revocation_id": "9c7d...-...",
+    "revocation_seq": 3,
+    "receipt_id": "d56b60a2-...",
+    "receipt_revision": 1,
+    "reason": "signer key compromised",
+    "key_id": "receipt-signing#1",
+    "command_id": "cmd-2026-09-29-001",
+    "effective_at": "2026-09-26T07:58:20+00:00",
+    "effective_at_unix": 1790301500,
+    "revoked_at": "2026-09-29T12:00:00.123456+00:00",
+    "revoked_at_unix": 1790395200,
+    "prev_seq": 2,
+    "prev_payload_sha256": "9b6c...",
+    "payload": "revocation/v1\nrevocation_id: 9c7d...-\nrevocation_seq: 3\n...",
+    "payload_sha256": "4f2a...",
+    "signature": "k8sQ...base64..."
+  }
+}
+```
+
+规范载荷（签名对象即这段字节，`prev_*` 把每条记录链接到前一条，创世记录两者皆空）：
+
+```
+revocation/v1
+revocation_id: 9c7da1f0-...
+revocation_seq: 3
+receipt_id: d56b60a2-078c-4443-8863-8ad2f05643db
+receipt_revision: 1
+reason: signer key compromised
+effective_at: 1790301500
+revoked_at: 1790395200
+key_id: receipt-signing#1
+command_id: cmd-2026-09-29-001
+prev_seq: 2
+prev_payload_sha256: 9b6c...
+```
+
+**保证**：撤销记录**不可变**（数据库触发器拒绝 UPDATE/DELETE）、序号全局无间隙（advisory lock 串行化 + 唯一约束兜底）、每回执至多一条记录（`UNIQUE(receipt_id)`）；全部状态在 PostgreSQL 中，无进程内缓存，**重启与并发下结果一致**（并发相同命令恰有一个 `201`、其余 `200` 重放同一记录；并发不同命令恰有一个成功、其余 `409`）。撤销**不改动**原回执（`GET /receipts/{id}` 响应不变），也不影响 `/verify` 的防重放语义。
+
+### 时点核验与撤销证明查询
+
+| 接口 | 说明 |
+| --- | --- |
+| `GET /receipts/{receipt_id}/status?at=<unix或ISO-8601>` | **时点状态**（公开）：`valid` / `revoked` / `unknown`；`at` 省略为当前时刻 |
+| `GET /receipts/{receipt_id}/revocation` | 回执的签名撤销记录（公开）；未撤销返回 `404 revocation_unknown` |
+| `GET /revocations` | 完整**审计链**（公开，按序号升序），响应含 `head_seq` 与 `head_payload_sha256` |
+
+时点状态语义：
+
+- `unknown`：回执不存在，或在 `at` 时刻尚未签发；
+- `valid`：回执在 `at` 时刻已签发，且撤销尚未生效（`at < effective_at`，含从未撤销）；
+- `revoked`：`at >= effective_at`，响应携带**签名撤销证明**（即撤销记录文档）。
+
+```bash
+# 当前状态（含签名撤销证明）
+curl -s http://localhost:8000/receipts/<receipt_id>/status | jq .
+# 指定时点（unix 秒或 ISO-8601）
+curl -s "http://localhost:8000/receipts/<receipt_id>/status?at=1790301500" | jq .
+curl -s "http://localhost:8000/receipts/<receipt_id>/status?at=2026-09-26T07:58:20Z" | jq .
+# 完整审计链
+curl -s http://localhost:8000/revocations | jq .
+```
+
+### 离线核验撤销证明与审计链
+
+`tools/verify_receipt.py` 在回执核验之外增加三个可选参数，全程离线：
+
+```bash
+# 保存撤销证明（撤销命令响应、GET .../revocation 或 .../status 响应均可）
+curl -s http://localhost:8000/receipts/<receipt_id>/revocation > revocation.json
+curl -s http://localhost:8000/revocations > chain.json
+
+python3 tools/verify_receipt.py --receipt receipt.json --keys keys.json \
+    --revocation revocation.json --at 1790395200 --chain chain.json
+```
+
+新增检查（任一失败退出码为 1）：
+
+1. `revocation/v1` 规范载荷结构严格合法，镜像字段与签名载荷一致；
+2. 用公布的（含已轮换的）历史公钥验证撤销记录 Ed25519 签名；
+3. **跨回执复用必须失败**：撤销证明的 `receipt_id` 必须等于被核验回执；
+4. **时间倒流必须失败**：`--at` 必须不早于回执签发时间，且不早于撤销的 `effective_at`；
+5. **审计链**：序号从 1 无间隙、每条记录哈希链接前一条、全部签名有效；链文件带有服务端公布的链头（`GET /revocations` 响应）时，链尾必须与链头一致（截断或续接的链被拒绝）；给定 `--revocation` 时必须原样锚定在链中。
+
 ## 示例请求（端到端脚本）
 
-仓库内置一个完整演示客户端：生成 Ed25519 密钥 → 登记公钥 → 对一条带 JSON 正文的请求签名 → 提交验收 → 再次提交展示防重放 → 影子验签 → 用公布的公钥离线核验验收回执。
+仓库内置一个完整演示客户端：生成 Ed25519 密钥 → 登记公钥 → 对一条带 JSON 正文的请求签名 → 提交验收 → 再次提交展示防重放 → 影子验签 → 用公布的公钥离线核验验收回执 → 提交幂等撤销命令 → 时点状态查询 → 离线核验撤销证明与审计链。
 
 ```bash
 pip install -r requirements.txt httpx
@@ -438,6 +568,10 @@ PYTHONPATH=. python3 examples/demo_client.py http://localhost:8000 admin-secret
 first  /verify -> 200      {"status": "accepted", "key_version": 1, "receipt": {...}, ...}
 second /verify -> 409      {"status": "replayed", "reason": "replayed", ...}
 receipt d56b60a2-... (key receipt-signing#1): signature OK, input binding OK
+revoke -> 201
+replay -> 200 (idempotent_replay=true)
+status at effective_at-10s: valid; at effective_at+10s: revoked
+revocation proof: signature OK, receipt binding OK, chain head seq 1
 ```
 
 手写 `curl` 可参考 `examples/` 目录中字段结构；签名逻辑（Content-Digest、基串、签名）见 `app/signer.py`，可直接作为 SDK 参考。
@@ -456,18 +590,19 @@ python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 pip install pytest httpx pgserver        # 测试依赖（pgserver 会自动拉起嵌入式 PostgreSQL）
 
-pytest -q                                  # 96 个测试，无需预装 PostgreSQL
+pytest -q                                  # 120 个测试，无需预装 PostgreSQL
 ```
 
-测试覆盖：RFC 9421 附录 B 基串向量与官方 Ed25519/RSA-PSS 签名、派生组件、SF/遗留头规范化、Content-Digest、密钥轮换、策略、新鲜度、并发防重放、全部稳定原因码，以及策略草稿/原子激活（含并发激活竞争与基线冲突）、影子验签只读性（不消费 nonce、不影响正式验收）、跨版本差异与重启一致性、旧库平滑升级，以及验收回执（签发与持久化、按 ID 查询、拒绝/重放/影子不产生回执、并发重复 nonce 至多一份、签发失败整体回滚、密钥轮换后旧回执仍可核验、独立离线验签器端到端）。
+测试覆盖：RFC 9421 附录 B 基串向量与官方 Ed25519/RSA-PSS 签名、派生组件、SF/遗留头规范化、Content-Digest、密钥轮换、策略、新鲜度、并发防重放、全部稳定原因码，以及策略草稿/原子激活（含并发激活竞争与基线冲突）、影子验签只读性（不消费 nonce、不影响正式验收）、跨版本差异与重启一致性、旧库平滑升级，验收回执（签发与持久化、按 ID 查询、拒绝/重放/影子不产生回执、并发重复 nonce 至多一份、签发失败整体回滚、密钥轮换后旧回执仍可核验、独立离线验签器端到端），以及回执撤销（幂等命令与冲突拒绝、乐观并发版本、并发命令恰一条记录、无间隙哈希审计链、不可变性触发器、签发失败整体回滚、时点状态三态与 `effective_at` 边界、重启一致性、轮换密钥下旧撤销记录可核验、离线工具对篡改/时间倒流/跨回执复用/断链的拒绝）。
 
 ## 项目结构
 
 ```
 app/
   config.py      # 环境变量与默认策略
-  db.py          # 连接池、建表、密钥版本登记、不可变策略版本/草稿/激活、同事务 nonce 防重放与回执签发
+  db.py          # 连接池、建表、密钥版本登记、不可变策略版本/草稿/激活、同事务 nonce 防重放、回执签发与撤销
   receipts.py    # 回执版本化规范载荷、验签输入确定性摘要、Ed25519 签名/验签（离线验签器复用）
+  revocations.py # 撤销记录规范载荷（revocation/v1）与哈希审计链（离线验签器复用）
   policy_diff.py # 策略版本间逐项差异（列表增删 + 标量开关）
   sf9421.py      # 支持字符串标签的 Signature SF 字典解析（基于 http-sfv）
   base.py        # RFC 9421 §2.5 签名基串重建（派生组件/头规范化）
@@ -476,12 +611,12 @@ app/
   verifier.py    # 端到端验收编排（live 写 nonce + 签回执 / shadow 只读）与稳定原因码
   signer.py      # 客户端签名辅助（演示与测试使用）
   schemas.py     # Pydantic 模型
-  main.py        # FastAPI 路由（/verify、/verify-shadow、/receipts/* 与 /admin/*）
+  main.py        # FastAPI 路由（/verify、/verify-shadow、/receipts/*、/revocations 与 /admin/*）
 tools/
-  verify_receipt.py # 可独立运行的离线回执验签器（仅需 cryptography）
+  verify_receipt.py # 可独立运行的离线验签器：回执 + 撤销证明 + 审计链（仅需 cryptography）
 examples/
-  demo_client.py # 端到端演示脚本（含回执离线核验）
-tests/           # pytest 测试套件（含 RFC 官方测试向量与回执测试）
+  demo_client.py # 端到端演示脚本（含回执离线核验与撤销演示）
+tests/           # pytest 测试套件（含 RFC 官方测试向量、回执与撤销测试）
 docker-compose.yml
 Dockerfile
 requirements.txt

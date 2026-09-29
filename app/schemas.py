@@ -1,6 +1,7 @@
 """Pydantic models for the verification and admin APIs."""
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field
@@ -64,6 +65,24 @@ class ShadowVerifyRequest(VerifyRequest):
 class RegisterKeyRequest(BaseModel):
     keyid: str = Field(..., min_length=1, max_length=256)
     public_key: str = Field(..., description="PEM SPKI, base64 DER SPKI, or 32-byte raw Ed25519 (base64)")
+
+
+class RevokeReceiptRequest(BaseModel):
+    """Idempotent receipt-revocation command.
+
+    ``effective_at`` accepts unix seconds (integer) or an ISO-8601 timestamp.
+    ``expected_revision`` is the optimistic-concurrency token: it must equal
+    the receipt's current revision (0 for a never-revoked receipt).
+    ``command_id`` is an optional idempotency key; resubmitting the same
+    command returns the original record instead of failing.
+    """
+
+    reason: str = Field(..., min_length=1, max_length=512)
+    effective_at: Union[int, datetime] = Field(
+        ..., description="When the revocation takes effect (unix seconds or ISO-8601)"
+    )
+    expected_revision: int = Field(..., ge=0)
+    command_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
 
 
 class KeyInfo(BaseModel):

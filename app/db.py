@@ -6,14 +6,14 @@ import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 import psycopg2
 from psycopg2 import pool as pg_pool
 from psycopg2.errors import UniqueViolation
 from psycopg2.extras import Json
 
-from . import config, receipts
+from . import config, receipts, revocations
 from .crypto import (
     generate_ed25519,
     load_private_key,
@@ -60,6 +60,39 @@ class PolicyDraftNotActivatable(Exception):
         )
         self.version = version
         self.status = status
+
+
+class ReceiptUnknown(Exception):
+    """Raised when a revocation targets a receipt id that does not exist."""
+
+    def __init__(self, receipt_id: str):
+        super().__init__(f"receipt {receipt_id!r} does not exist")
+        self.receipt_id = receipt_id
+
+
+class RevocationConflict(Exception):
+    """Raised when the receipt is already revoked by a *different* command."""
+
+    def __init__(self, message: str, *, revocation: Dict[str, Any]):
+        super().__init__(message)
+        self.revocation = revocation
+
+
+class RevocationRevisionConflict(Exception):
+    """Raised when ``expected_revision`` does not match the receipt revision."""
+
+    def __init__(self, message: str, *, current_revision: int):
+        super().__init__(message)
+        self.current_revision = current_revision
+
+
+class RevocationIssuanceError(Exception):
+    """Raised when revocation signing/persistence fails.
+
+    The caller's transaction — including the receipt revision bump — rolls
+    back as a whole, so no partial revocation state survives and the command
+    can be retried safely.
+    """
 
 
 _pool: Optional[pg_pool.ThreadedConnectionPool] = None
@@ -175,6 +208,47 @@ CREATE TABLE IF NOT EXISTS receipts (
 CREATE INDEX IF NOT EXISTS receipts_issued_idx ON receipts (issued_at);
 CREATE INDEX IF NOT EXISTS receipts_signer_nonce_idx
     ON receipts (signer_keyid, nonce);
+-- Idempotent upgrade for databases created before receipt revocation:
+-- a per-receipt optimistic-concurrency revision (0 = issued, 1 = revoked).
+ALTER TABLE receipts
+    ADD COLUMN IF NOT EXISTS revision INTEGER NOT NULL DEFAULT 0;
+
+-- Immutable, sequenced revocation records forming a hash-chained audit log.
+-- Each record links to its predecessor via prev_payload_sha256; the chain is
+-- allocated under an advisory lock so concurrent revocations stay gapless.
+CREATE TABLE IF NOT EXISTS receipt_revocations (
+    id                  BIGSERIAL PRIMARY KEY,
+    revocation_id       TEXT NOT NULL UNIQUE,
+    revocation_seq      BIGINT NOT NULL UNIQUE,
+    receipt_id          TEXT NOT NULL UNIQUE REFERENCES receipts (receipt_id),
+    command_id          TEXT,
+    expected_revision   INTEGER NOT NULL,
+    receipt_revision    INTEGER NOT NULL,
+    reason              TEXT NOT NULL,
+    effective_at        TIMESTAMPTZ NOT NULL,
+    revoked_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    key_id              TEXT NOT NULL,
+    prev_payload_sha256 TEXT,
+    payload             TEXT NOT NULL,
+    payload_sha256      TEXT NOT NULL,
+    signature           TEXT NOT NULL
+);
+-- At most one revocation per idempotency key, enforced by the database.
+CREATE UNIQUE INDEX IF NOT EXISTS receipt_revocations_command_uidx
+    ON receipt_revocations (command_id) WHERE command_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS receipt_revocations_seq_idx
+    ON receipt_revocations (revocation_seq);
+
+-- Revocation records are immutable: the database itself rejects changes.
+CREATE OR REPLACE FUNCTION reject_revocation_mutation() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'receipt_revocations rows are immutable';
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS receipt_revocations_immutable ON receipt_revocations;
+CREATE TRIGGER receipt_revocations_immutable
+    BEFORE UPDATE OR DELETE ON receipt_revocations
+    FOR EACH ROW EXECUTE FUNCTION reject_revocation_mutation();
 """
 
 DEFAULT_POLICY: Dict[str, Any] = {
@@ -1034,3 +1108,269 @@ def get_receipt(receipt_id: str) -> Optional[Dict[str, Any]]:
     return receipts.receipt_document(
         payload=row[0], signature=row[1], issued_at=row[2].isoformat()
     )
+
+
+# ---------------------------------------------------------------------------
+# Receipt revocation — the command, the receipt revision bump and the audit
+# chain append commit in ONE transaction, so concurrent commands and restarts
+# observe exactly one consistent outcome.
+# ---------------------------------------------------------------------------
+
+_REVOCATION_SELECT = """
+    SELECT payload, signature, effective_at, revoked_at,
+           command_id, expected_revision, reason
+    FROM receipt_revocations
+"""
+
+
+def _revocation_doc_from_row(r) -> Dict[str, Any]:
+    # Column order matches _REVOCATION_SELECT.
+    return revocations.revocation_document(
+        payload=r[0],
+        signature=r[1],
+        effective_at=r[2].isoformat(),
+        revoked_at=r[3].isoformat(),
+    )
+
+
+def _get_revocation_row(cur, receipt_id: str):
+    cur.execute(
+        _REVOCATION_SELECT + " WHERE receipt_id = %s",
+        (receipt_id,),
+    )
+    return cur.fetchone()
+
+
+def _command_matches(
+    row,
+    *,
+    reason: str,
+    effective_at: datetime,
+    expected_revision: int,
+    command_id: Optional[str],
+) -> bool:
+    """True when the stored revocation came from an identical command.
+
+    With an idempotency key (``command_id``) on either side, both must carry
+    the same key; the command parameters must always match as well.
+    """
+    stored_command_id = row[4]
+    if command_id is not None or stored_command_id is not None:
+        if command_id is None or stored_command_id != command_id:
+            return False
+    stored_effective_at = int(row[2].timestamp())
+    return (
+        row[6] == reason
+        and stored_effective_at == int(effective_at.timestamp())
+        and row[5] == expected_revision
+    )
+
+
+def revoke_receipt(
+    *,
+    receipt_id: str,
+    reason: str,
+    effective_at: datetime,
+    expected_revision: int,
+    command_id: Optional[str] = None,
+) -> Tuple[Dict[str, Any], bool]:
+    """Idempotently revoke one receipt; return ``(document, created)``.
+
+    One transaction, in order:
+
+    1. lock the receipt row (``FOR UPDATE``) — unknown ids are rejected;
+    2. if a revocation already exists, an identical command is an idempotent
+       replay (``created=False``) and a different one a conflict;
+    3. ``expected_revision`` must equal the receipt's current revision
+       (optimistic concurrency);
+    4. under a global advisory lock, allocate the next gapless audit-chain
+       sequence and read the chain head;
+    5. bump the receipt revision with an atomic compare-and-swap, build the
+       canonical ``revocation/v1`` payload, sign it with the active
+       receipt-signing key and insert the immutable record.
+
+    Everything commits or rolls back together, so a crash or a conflict
+    leaves no partial state and the command can be retried safely.
+    """
+    effective_at = effective_at.astimezone(timezone.utc)
+    with transaction() as cur:
+        cur.execute(
+            "SELECT revision FROM receipts WHERE receipt_id = %s FOR UPDATE",
+            (receipt_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise ReceiptUnknown(receipt_id)
+        current_revision = row[0]
+
+        existing = _get_revocation_row(cur, receipt_id)
+        if existing is not None:
+            document = _revocation_doc_from_row(existing)
+            if _command_matches(
+                existing,
+                reason=reason,
+                effective_at=effective_at,
+                expected_revision=expected_revision,
+                command_id=command_id,
+            ):
+                return document, False
+            raise RevocationConflict(
+                f"receipt {receipt_id!r} is already revoked by a different "
+                f"command (revocation {document['revocation_id']!r})",
+                revocation=document,
+            )
+
+        if expected_revision != current_revision:
+            raise RevocationRevisionConflict(
+                f"expected_revision {expected_revision} does not match the "
+                f"receipt's current revision {current_revision}",
+                current_revision=current_revision,
+            )
+
+        # Serialise all revocations so chain allocation is race-free; the
+        # UNIQUE(revocation_seq) constraint is the database-enforced backstop.
+        cur.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended('receipt_revocations', 0))"
+        )
+        cur.execute(
+            "SELECT revocation_seq, payload_sha256 FROM receipt_revocations "
+            "ORDER BY revocation_seq DESC LIMIT 1"
+        )
+        head = cur.fetchone()
+        prev_seq = head[0] if head else 0
+        prev_hash = head[1] if head else None
+        seq = prev_seq + 1
+
+        # Atomic compare-and-swap of the receipt revision (the FOR UPDATE row
+        # lock is already held, so this cannot lose a race).
+        cur.execute(
+            "UPDATE receipts SET revision = revision + 1 "
+            "WHERE receipt_id = %s AND revision = %s",
+            (receipt_id, expected_revision),
+        )
+        if cur.rowcount != 1:  # pragma: no cover - defensive
+            raise RevocationRevisionConflict(
+                "receipt revision changed underneath the command",
+                current_revision=current_revision,
+            )
+
+        try:
+            key = ensure_receipt_signing_key(cur)
+            private_key = load_private_key(key["private_key"])
+            now = datetime.now(timezone.utc)
+            new_revision = expected_revision + 1
+            revocation_id = str(uuid.uuid4())
+            payload = revocations.build_payload(
+                revocation_id=revocation_id,
+                revocation_seq=seq,
+                receipt_id=receipt_id,
+                receipt_revision=new_revision,
+                reason=reason,
+                effective_at=int(effective_at.timestamp()),
+                revoked_at=int(now.timestamp()),
+                key_id=key["key_id"],
+                command_id=command_id,
+                prev_seq=prev_seq,
+                prev_payload_sha256=prev_hash,
+            )
+            signature = receipts.sign_payload(private_key, payload)
+            cur.execute(
+                """
+                INSERT INTO receipt_revocations (
+                    revocation_id, revocation_seq, receipt_id, command_id,
+                    expected_revision, receipt_revision, reason,
+                    effective_at, revoked_at, key_id, prev_payload_sha256,
+                    payload, payload_sha256, signature
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    revocation_id,
+                    seq,
+                    receipt_id,
+                    command_id,
+                    expected_revision,
+                    new_revision,
+                    reason,
+                    effective_at,
+                    now,
+                    key["key_id"],
+                    prev_hash,
+                    payload,
+                    revocations.payload_sha256(payload),
+                    signature,
+                ),
+            )
+        except RevocationIssuanceError:
+            raise
+        except Exception as exc:
+            raise RevocationIssuanceError(
+                f"could not issue revocation record: {exc}"
+            ) from exc
+
+        document = revocations.revocation_document(
+            payload=payload,
+            signature=signature,
+            effective_at=effective_at.isoformat(),
+            revoked_at=now.isoformat(),
+        )
+        return document, True
+
+
+def get_revocation_for_receipt(receipt_id: str) -> Optional[Dict[str, Any]]:
+    """Fetch the revocation record of one receipt (read-only)."""
+    with transaction(read_only=True) as cur:
+        row = _get_revocation_row(cur, receipt_id)
+    return _revocation_doc_from_row(row) if row is not None else None
+
+
+def list_revocations() -> list:
+    """Return the whole revocation audit chain, ordered by sequence."""
+    with transaction(read_only=True) as cur:
+        cur.execute(_REVOCATION_SELECT + " ORDER BY revocation_seq ASC")
+        return [_revocation_doc_from_row(r) for r in cur.fetchall()]
+
+
+def receipt_status_at(receipt_id: str, at: datetime) -> Dict[str, Any]:
+    """Point-in-time receipt status: ``valid`` / ``revoked`` / ``unknown``.
+
+    ``unknown`` means no such receipt exists, or the receipt had not yet been
+    issued at ``at``.  ``revoked`` applies from the revocation's
+    ``effective_at`` onwards; before that moment the receipt reads ``valid``.
+    The answer derives only from persisted state, so it is identical across
+    processes and restarts.
+    """
+    at = at.astimezone(timezone.utc)
+    at_ts = int(at.timestamp())
+    answer: Dict[str, Any] = {
+        "receipt_id": receipt_id,
+        "at": at.isoformat(),
+        "at_unix": at_ts,
+    }
+    with transaction(read_only=True) as cur:
+        cur.execute(
+            "SELECT issued_at, revision FROM receipts WHERE receipt_id = %s",
+            (receipt_id,),
+        )
+        row = cur.fetchone()
+        if row is None or at_ts < int(row[0].timestamp()):
+            answer["status"] = "unknown"
+            return answer
+
+        issued_at, revision = row
+        answer.update(
+            {
+                "issued_at": issued_at.isoformat(),
+                "issued_at_unix": int(issued_at.timestamp()),
+                "revision": revision,
+            }
+        )
+        revocation_row = _get_revocation_row(cur, receipt_id)
+        if revocation_row is not None and at_ts >= int(
+            revocation_row[2].timestamp()
+        ):
+            answer["status"] = "revoked"
+            answer["revocation"] = _revocation_doc_from_row(revocation_row)
+        else:
+            answer["status"] = "valid"
+            answer["revocation"] = None
+        return answer

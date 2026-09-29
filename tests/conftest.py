@@ -42,7 +42,7 @@ def _clean_tables():
     with db.transaction() as cur:
         cur.execute(
             "TRUNCATE used_nonces, signer_keys, verify_policy, policy_versions, "
-            "receipts, receipt_keys RESTART IDENTITY"
+            "receipts, receipt_keys, receipt_revocations RESTART IDENTITY"
         )
         db._seed_initial_policy(cur)
         db.ensure_receipt_signing_key(cur)

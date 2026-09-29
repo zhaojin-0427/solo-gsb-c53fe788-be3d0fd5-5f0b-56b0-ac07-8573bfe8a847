@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
@@ -17,6 +18,7 @@ from .schemas import (
     PolicyActivateRequest,
     PolicyDraftRequest,
     RegisterKeyRequest,
+    RevokeReceiptRequest,
     ShadowVerifyRequest,
     VerifyRequest,
 )
@@ -43,10 +45,11 @@ app = FastAPI(
         "[RFC 9421](https://www.rfc-editor.org/rfc/rfc9421), with "
         "Content-Digest (RFC 9530), Ed25519 / RSA-PSS keys, freshness policy, "
         "atomic nonce replay protection, immutable policy versioning, "
-        "read-only shadow verification and signed, offline-verifiable "
-        "acceptance receipts."
+        "read-only shadow verification, signed offline-verifiable acceptance "
+        "receipts, and idempotent receipt revocation with a signed, "
+        "hash-chained audit trail and point-in-time status queries."
     ),
-    version="2.1.0",
+    version="2.2.0",
     lifespan=lifespan,
 )
 
@@ -63,9 +66,13 @@ _FAILURE_STATUS = {
     reasons.UNKNOWN_KEY: status.HTTP_404_NOT_FOUND,
     reasons.POLICY_VERSION_UNKNOWN: status.HTTP_404_NOT_FOUND,
     reasons.RECEIPT_UNKNOWN: status.HTTP_404_NOT_FOUND,
+    reasons.REVOCATION_UNKNOWN: status.HTTP_404_NOT_FOUND,
     reasons.RECEIPT_ISSUANCE_FAILED: status.HTTP_500_INTERNAL_SERVER_ERROR,
+    reasons.REVOCATION_ISSUANCE_FAILED: status.HTTP_500_INTERNAL_SERVER_ERROR,
     reasons.POLICY_ACTIVATION_CONFLICT: status.HTTP_409_CONFLICT,
     reasons.POLICY_DRAFT_NOT_ACTIVATABLE: status.HTTP_409_CONFLICT,
+    reasons.REVOCATION_CONFLICT: status.HTTP_409_CONFLICT,
+    reasons.REVOCATION_REVISION_CONFLICT: status.HTTP_409_CONFLICT,
 }
 
 
@@ -298,6 +305,83 @@ def read_receipt(receipt_id: str) -> Dict[str, Any]:
     return receipt
 
 
+def _parse_instant(text: str, *, param: str) -> datetime:
+    """Parse a unix-seconds integer or an ISO-8601 timestamp (UTC if naive)."""
+    value = text.strip()
+    try:
+        return datetime.fromtimestamp(int(value), tz=timezone.utc)
+    except ValueError:
+        pass
+    if value.endswith(("Z", "z")):
+        value = value[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "reason": reasons.BAD_REQUEST,
+                "detail": f"{param} must be unix seconds or an ISO-8601 timestamp",
+            },
+        )
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+@app.get("/receipts/{receipt_id}/status")
+def receipt_status(receipt_id: str, at: Optional[str] = None) -> Dict[str, Any]:
+    """Point-in-time receipt status: ``valid`` / ``revoked`` / ``unknown``.
+
+    ``at`` defaults to now and accepts unix seconds or ISO-8601.  A revoked
+    answer carries the signed, offline-verifiable revocation proof.
+    """
+    moment = (
+        _parse_instant(at, param="at")
+        if at is not None
+        else datetime.now(timezone.utc)
+    )
+    return db.receipt_status_at(receipt_id, moment)
+
+
+@app.get("/receipts/{receipt_id}/revocation")
+def read_receipt_revocation(receipt_id: str) -> Dict[str, Any]:
+    """Fetch the signed revocation record of one receipt (public)."""
+    if db.get_receipt(receipt_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "reason": reasons.RECEIPT_UNKNOWN,
+                "detail": f"receipt {receipt_id!r} does not exist",
+            },
+        )
+    revocation = db.get_revocation_for_receipt(receipt_id)
+    if revocation is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "reason": reasons.REVOCATION_UNKNOWN,
+                "detail": f"receipt {receipt_id!r} is not revoked",
+            },
+        )
+    return revocation
+
+
+@app.get("/revocations")
+def list_revocations() -> Dict[str, Any]:
+    """Publish the whole revocation audit chain (public, ordered by sequence).
+
+    Offline verifiers fetch this to check the gapless sequence and the
+    hash linkage between records.
+    """
+    chain = db.list_revocations()
+    return {
+        "revocations": chain,
+        "head_seq": chain[-1]["revocation_seq"] if chain else 0,
+        "head_payload_sha256": chain[-1]["payload_sha256"] if chain else None,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Admin API
 # ---------------------------------------------------------------------------
@@ -467,3 +551,97 @@ def rotate_receipt_key(_: None = Depends(require_admin)) -> Dict[str, Any]:
     receipts issued before the rotation stay verifiable offline.
     """
     return db.rotate_receipt_signing_key()
+
+
+# --- Receipt revocation -----------------------------------------------------
+
+
+def _normalize_effective_at(value: Any) -> datetime:
+    """Normalise the command's effective_at to a tz-aware UTC datetime."""
+    if isinstance(value, bool):  # bool is a subclass of int
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "reason": reasons.BAD_REQUEST,
+                "detail": "effective_at must be unix seconds or an ISO-8601 timestamp",
+            },
+        )
+    if isinstance(value, int):
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+    moment = value
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
+
+
+@app.post("/admin/receipts/{receipt_id}/revoke")
+def revoke_receipt(
+    receipt_id: str,
+    req: RevokeReceiptRequest,
+    _: None = Depends(require_admin),
+) -> JSONResponse:
+    """Idempotently revoke one acceptance receipt (single transaction).
+
+    The receipt row is locked, unknown ids are rejected (404), a stale
+    ``expected_revision`` is rejected (409), and a conflicting command for an
+    already-revoked receipt is rejected (409).  Resubmitting the *same*
+    command returns the original record (200, ``idempotent_replay: true``).
+    The immutable, sequenced revocation record is signed with the server's
+    Ed25519 key and committed atomically with the audit-chain linkage.
+    """
+    effective_at = _normalize_effective_at(req.effective_at)
+    try:
+        document, created = db.revoke_receipt(
+            receipt_id=receipt_id,
+            reason=req.reason,
+            effective_at=effective_at,
+            expected_revision=req.expected_revision,
+            command_id=req.command_id,
+        )
+    except db.ReceiptUnknown:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "reason": reasons.RECEIPT_UNKNOWN,
+                "detail": f"receipt {receipt_id!r} does not exist",
+            },
+        )
+    except db.RevocationRevisionConflict as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "reason": reasons.REVOCATION_REVISION_CONFLICT,
+                "detail": str(exc),
+                "current_revision": exc.current_revision,
+            },
+        )
+    except db.RevocationConflict as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "reason": reasons.REVOCATION_CONFLICT,
+                "detail": str(exc),
+                "revocation": exc.revocation,
+            },
+        )
+    except db.RevocationIssuanceError as exc:
+        # Signing/persistence failed: the whole transaction — including the
+        # revision bump — was rolled back, so the command can be retried.
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "status": "error",
+                "reason": reasons.REVOCATION_ISSUANCE_FAILED,
+                "detail": str(exc),
+            },
+        )
+
+    return JSONResponse(
+        status_code=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        content={
+            "status": "revoked",
+            "receipt_id": receipt_id,
+            "idempotent_replay": not created,
+            "revocation": document,
+        },
+    )

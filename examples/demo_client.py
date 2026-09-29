@@ -13,6 +13,9 @@
    unaffected).
 7. Verify the acceptance receipt offline against the public keys published
    at GET /receipts/keys.
+8. Revoke the receipt (idempotent admin command), query its point-in-time
+   status, and verify the signed revocation proof plus the audit chain
+   offline.
 
 Usage:
     python examples/demo_client.py [base_url] [admin_token]
@@ -23,10 +26,11 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 
 import httpx
 
-from app import receipts
+from app import receipts, revocations
 from app.crypto import generate_ed25519, load_public_key, public_key_pem
 from app.signer import make_signed_request
 
@@ -137,6 +141,71 @@ def main() -> int:
         )
         print("offline check: python tools/verify_receipt.py --receipt r.json "
               "--keys keys.json [--request request.json]")
+
+    # 8. Revoke the receipt and verify the revocation offline -----------------
+    if receipt:
+        receipt_id = receipt["receipt_id"]
+        command = {
+            "reason": "demo: signer key retired",
+            # Slightly in the future so both sides of the point-in-time
+            # status query below are deterministic.
+            "effective_at": int(time.time()) + 30,
+            "expected_revision": 0,
+            "command_id": f"demo-{receipt_id}",
+        }
+        r = httpx.post(
+            f"{base_url}/admin/receipts/{receipt_id}/revoke",
+            headers=admin_headers,
+            json=command,
+            timeout=10,
+        )
+        print(f"\nrevoke -> {r.status_code}")
+        revocation = r.json()["revocation"]
+        print(f"revocation seq {revocation['revocation_seq']}, "
+              f"id {revocation['revocation_id']}")
+
+        # Resubmitting the identical command is an idempotent replay.
+        r = httpx.post(
+            f"{base_url}/admin/receipts/{receipt_id}/revoke",
+            headers=admin_headers,
+            json=command,
+            timeout=10,
+        )
+        print(f"replay -> {r.status_code} "
+              f"(idempotent_replay={r.json()['idempotent_replay']})")
+
+        # Point-in-time status: before vs after the effective time.
+        before = httpx.get(
+            f"{base_url}/receipts/{receipt_id}/status",
+            params={"at": command["effective_at"] - 10},
+            timeout=10,
+        ).json()
+        after = httpx.get(
+            f"{base_url}/receipts/{receipt_id}/status",
+            params={"at": command["effective_at"] + 10},
+            timeout=10,
+        ).json()
+        print(f"status at effective_at-10s: {before['status']}; "
+              f"at effective_at+10s: {after['status']}")
+
+        # Offline: the signed proof binds this receipt and verifies against
+        # the published keys; the audit chain is gapless and hash-linked.
+        keys = httpx.get(f"{base_url}/receipts/keys", timeout=10).json()["keys"]
+        entry = next(k for k in keys if k["key_id"] == revocation["key_id"])
+        public_key = load_public_key(entry["public_key"])
+        proof_ok = receipts.verify_payload_signature(
+            public_key, revocation["payload"], revocation["signature"]
+        )
+        fields = revocations.parse_payload(revocation["payload"])
+        bound = fields["receipt_id"] == receipt_id
+        chain = httpx.get(f"{base_url}/revocations", timeout=10).json()
+        print(
+            f"revocation proof: signature {'OK' if proof_ok else 'INVALID'}, "
+            f"receipt binding {'OK' if bound else 'MISMATCH'}, "
+            f"chain head seq {chain['head_seq']}"
+        )
+        print("offline check: python tools/verify_receipt.py --receipt r.json "
+              "--keys keys.json --revocation rev.json --at <ts> --chain chain.json")
 
     return 0
 
