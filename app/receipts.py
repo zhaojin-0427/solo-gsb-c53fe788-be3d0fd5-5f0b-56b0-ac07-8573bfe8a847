@@ -27,8 +27,11 @@ from typing import Any, Dict, List, Optional
 
 from cryptography.exceptions import InvalidSignature
 
-#: Version tag of the canonical payload format (first payload line).
+#: Version tag of the canonical receipt payload format (first payload line).
 PAYLOAD_VERSION = "receipt/v1"
+
+#: Version tag of the canonical revocation payload format (first payload line).
+REVOCATION_PAYLOAD_VERSION = "receipt-revocation/v1"
 
 #: Logical keyid of the server receipt-signing key (its versions rotate).
 RECEIPT_KEYID = "receipt-signing"
@@ -47,9 +50,22 @@ PAYLOAD_FIELDS = (
     "input_digest",
 )
 
+#: Canonical field order of a revocation record after the version line.
+REVOCATION_FIELDS = (
+    "revocation_id",
+    "key_id",
+    "receipt_id",
+    "sequence",
+    "revision",
+    "receipt_payload_sha256",
+    "reason",
+    "effective_at",
+    "revoked_at",
+)
+
 
 class ReceiptFormatError(ValueError):
-    """Raised when a receipt payload is not well-formed."""
+    """Raised when a receipt (or revocation) payload is not well-formed."""
 
 
 # ---------------------------------------------------------------------------
@@ -227,4 +243,113 @@ def receipt_document(*, payload: str, signature: str, issued_at: str) -> Dict[st
             "label": fields["label"],
             "nonce": fields["nonce"],
         },
+    }
+
+
+def payload_sha256(payload: str) -> str:
+    """Hex SHA-256 of the exact canonical payload bytes (tamper evidence)."""
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Revocation records — immutable, sequenced, server-signed
+#
+# A revocation binds to *one* acceptance receipt (receipt_id plus the
+# receipt payload hash) so a signed revocation can never be replayed onto a
+# different receipt, and carries both the requested effective time and the
+# server revocation time so offline time-travel checks are possible.
+# ---------------------------------------------------------------------------
+
+
+def build_revocation_payload(
+    *,
+    revocation_id: str,
+    key_id: str,
+    receipt_id: str,
+    sequence: int,
+    revision: int,
+    receipt_payload_sha256: str,
+    reason: str,
+    effective_at: int,
+    revoked_at: int,
+) -> str:
+    """Build the canonical ``receipt-revocation/v1`` payload that gets signed."""
+    values = {
+        "revocation_id": str(revocation_id),
+        "key_id": str(key_id),
+        "receipt_id": str(receipt_id),
+        "sequence": str(int(sequence)),
+        "revision": str(int(revision)),
+        "receipt_payload_sha256": receipt_payload_sha256,
+        "reason": reason,
+        "effective_at": str(int(effective_at)),
+        "revoked_at": str(int(revoked_at)),
+    }
+    lines = [REVOCATION_PAYLOAD_VERSION]
+    for name in REVOCATION_FIELDS:
+        value = values[name]
+        if "\n" in value or "\r" in value:
+            raise ReceiptFormatError(
+                f"revocation field {name!r} must not contain newlines"
+            )
+        lines.append(f"{name}: {value}")
+    return "\n".join(lines)
+
+
+def parse_revocation_payload(payload: str) -> Dict[str, Any]:
+    """Parse and strictly validate a canonical revocation payload.
+
+    Raises ``ReceiptFormatError`` unless the payload has exactly the
+    versioned field set in canonical order.
+    """
+    if not isinstance(payload, str):
+        raise ReceiptFormatError("revocation payload must be a string")
+    lines = payload.split("\n")
+    if lines[0] != REVOCATION_PAYLOAD_VERSION:
+        raise ReceiptFormatError(
+            f"unsupported revocation payload version {lines[0]!r} "
+            f"(expected {REVOCATION_PAYLOAD_VERSION!r})"
+        )
+    fields = lines[1:]
+    if len(fields) != len(REVOCATION_FIELDS):
+        raise ReceiptFormatError(
+            f"revocation payload must have {len(REVOCATION_FIELDS)} fields, "
+            f"got {len(fields)}"
+        )
+    out: Dict[str, Any] = {}
+    for line, expected in zip(fields, REVOCATION_FIELDS):
+        name, sep, value = line.partition(": ")
+        if not sep or name != expected:
+            raise ReceiptFormatError(
+                f"revocation payload field {expected!r} missing or out of order"
+            )
+        out[expected] = value
+    try:
+        out["sequence"] = int(out["sequence"])
+        out["revision"] = int(out["revision"])
+        out["effective_at"] = int(out["effective_at"])
+        out["revoked_at"] = int(out["revoked_at"])
+    except ValueError as exc:
+        raise ReceiptFormatError(
+            f"revocation payload has a non-integer field: {exc}"
+        )
+    return out
+
+
+def revocation_document(*, payload: str, signature: str) -> Dict[str, Any]:
+    """Shape the API revocation object; every field mirrors the signed payload."""
+    fields = parse_revocation_payload(payload)
+    return {
+        "revocation_id": fields["revocation_id"],
+        "key_id": fields["key_id"],
+        "receipt_id": fields["receipt_id"],
+        "sequence": fields["sequence"],
+        "revision": fields["revision"],
+        "receipt_payload_sha256": fields["receipt_payload_sha256"],
+        "reason": fields["reason"],
+        "effective_at": fields["effective_at"],
+        "revoked_at": fields["revoked_at"],
+        "payload": payload,
+        "payload_sha256": payload_sha256(payload),
+        "signature": signature,
     }

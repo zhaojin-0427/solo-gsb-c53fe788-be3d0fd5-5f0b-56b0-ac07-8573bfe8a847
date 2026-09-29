@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -16,6 +17,7 @@ from .schemas import (
     Policy,
     PolicyActivateRequest,
     PolicyDraftRequest,
+    ReceiptRevokeRequest,
     RegisterKeyRequest,
     ShadowVerifyRequest,
     VerifyRequest,
@@ -43,10 +45,11 @@ app = FastAPI(
         "[RFC 9421](https://www.rfc-editor.org/rfc/rfc9421), with "
         "Content-Digest (RFC 9530), Ed25519 / RSA-PSS keys, freshness policy, "
         "atomic nonce replay protection, immutable policy versioning, "
-        "read-only shadow verification and signed, offline-verifiable "
-        "acceptance receipts."
+        "read-only shadow verification, signed, offline-verifiable "
+        "acceptance receipts, and idempotent, signed receipt revocation "
+        "with point-in-time status verification."
     ),
-    version="2.1.0",
+    version="2.2.0",
     lifespan=lifespan,
 )
 
@@ -66,6 +69,11 @@ _FAILURE_STATUS = {
     reasons.RECEIPT_ISSUANCE_FAILED: status.HTTP_500_INTERNAL_SERVER_ERROR,
     reasons.POLICY_ACTIVATION_CONFLICT: status.HTTP_409_CONFLICT,
     reasons.POLICY_DRAFT_NOT_ACTIVATABLE: status.HTTP_409_CONFLICT,
+    reasons.RECEIPT_ALREADY_REVOKED: status.HTTP_409_CONFLICT,
+    reasons.REVOCATION_REVISION_CONFLICT: status.HTTP_409_CONFLICT,
+    reasons.REVOCATION_CONFLICT: status.HTTP_409_CONFLICT,
+    reasons.REVOCATION_EFFECTIVE_BEFORE_ISSUANCE: status.HTTP_409_CONFLICT,
+    reasons.REVOCATION_FAILED: status.HTTP_500_INTERNAL_SERVER_ERROR,
 }
 
 
@@ -82,9 +90,24 @@ async def _validation_handler(request: Request, exc: RequestValidationError):
             "status": "rejected",
             "reason": reasons.BAD_REQUEST,
             "detail": "request payload failed validation",
-            "errors": exc.errors(),
+            "errors": _json_safe_errors(exc.errors()),
         },
     )
+
+
+def _json_safe_errors(errors: list) -> list:
+    """Strip non-JSON-serializable objects (e.g. exception instances in ctx)."""
+    safe = []
+    for err in errors:
+        item = dict(err)
+        ctx = item.get("ctx")
+        if isinstance(ctx, dict):
+            item["ctx"] = {
+                k: (str(v) if isinstance(v, BaseException) else v)
+                for k, v in ctx.items()
+            }
+        safe.append(item)
+    return safe
 
 
 def _validation_errors(exc: Exception):
@@ -298,6 +321,36 @@ def read_receipt(receipt_id: str) -> Dict[str, Any]:
     return receipt
 
 
+@app.get("/receipts/{receipt_id}/status")
+def receipt_status(
+    receipt_id: str, at: Optional[int] = Query(default=None, ge=0)
+) -> Dict[str, Any]:
+    """Point-in-time receipt state: ``valid`` / ``revoked`` / ``unknown``.
+
+    ``at`` is a unix-seconds instant (defaults to now).  A revocation with a
+    later ``effective_at`` does not apply at the queried instant, so a
+    future-dated revocation still reports ``valid`` beforehand.  The
+    response embeds both the signed acceptance receipt and the signed
+    revocation proof (when one exists) so offline verifiers can validate
+    every claim without contacting the service again.
+
+    An unknown receipt reports HTTP 200 with ``status: "unknown"`` rather
+    than 404, because "unknown at time t" is itself a verifiable answer.
+    """
+    at_ts = at if at is not None else int(datetime.now(timezone.utc).timestamp())
+    state = db.get_receipt_status(receipt_id, at_ts)
+    if state is None:
+        return {
+            "receipt_id": receipt_id,
+            "status": "unknown",
+            "at": at_ts,
+            "issued_at_unix": None,
+            "receipt": None,
+            "revocation": None,
+        }
+    return state
+
+
 # ---------------------------------------------------------------------------
 # Admin API
 # ---------------------------------------------------------------------------
@@ -467,3 +520,109 @@ def rotate_receipt_key(_: None = Depends(require_admin)) -> Dict[str, Any]:
     receipts issued before the rotation stay verifiable offline.
     """
     return db.rotate_receipt_signing_key()
+
+
+# --- Receipt revocation -----------------------------------------------------
+
+
+@app.post("/admin/receipts/{receipt_id}/revoke")
+def revoke_receipt(
+    receipt_id: str,
+    req: ReceiptRevokeRequest,
+    _: None = Depends(require_admin),
+) -> JSONResponse:
+    """Idempotently revoke an acceptance receipt inside one transaction.
+
+    The command carries an explicit ``reason``, an ``effective_at`` instant
+    and an optimistic ``expected_revision`` (a fresh receipt is at revision
+    0).  Replaying the identical command returns the exact same immutable,
+    server-signed revocation proof (HTTP 200, ``idempotent: true``); a
+    different command against an already-revoked receipt is a 409 conflict.
+    The revocation record and its tamper-evident audit-chain entry commit
+    atomically (or roll back together).
+    """
+    try:
+        result = db.revoke_receipt(
+            receipt_id=receipt_id,
+            reason=req.reason,
+            effective_at=req.effective_at,
+            expected_revision=req.expected_revision,
+        )
+    except db.ReceiptNotFound:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={
+                "reason": reasons.RECEIPT_UNKNOWN,
+                "detail": f"receipt {receipt_id!r} does not exist",
+            },
+        )
+    except db.ReceiptAlreadyRevoked as exc:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "status": "error",
+                "reason": reasons.RECEIPT_ALREADY_REVOKED,
+                "detail": str(exc),
+                "receipt_id": exc.receipt_id,
+                "revocation_id": exc.revocation_id,
+                "current_revision": exc.revision,
+            },
+        )
+    except db.RevocationRevisionConflict as exc:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "status": "error",
+                "reason": reasons.REVOCATION_REVISION_CONFLICT,
+                "detail": str(exc),
+                "receipt_id": exc.receipt_id,
+                "expected_revision": exc.expected,
+                "current_revision": exc.current,
+            },
+        )
+    except db.RevocationEffectiveBeforeIssuance as exc:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "status": "error",
+                "reason": reasons.REVOCATION_EFFECTIVE_BEFORE_ISSUANCE,
+                "detail": str(exc),
+                "receipt_id": exc.receipt_id,
+                "effective_at": exc.effective_at,
+                "issued_at": exc.issued_at,
+            },
+        )
+    except db.RevocationError as exc:
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={
+                "status": "error",
+                "reason": reasons.REVOCATION_FAILED,
+                "detail": str(exc),
+            },
+        )
+
+    http_status = (
+        status.HTTP_200_OK if result["idempotent"] else status.HTTP_201_CREATED
+    )
+    return JSONResponse(
+        status_code=http_status,
+        content={
+            "revoked": True,
+            "idempotent": result["idempotent"],
+            "current_revision": result["revocation"]["revision"],
+            "revocation": result["revocation"],
+        },
+    )
+
+
+@app.get("/admin/audit/events")
+def audit_events(
+    event_type: Optional[str] = None,
+    _: None = Depends(require_admin),
+) -> Dict[str, Any]:
+    """List the tamper-evident audit chain (revocations and later events)."""
+    return {
+        "events": db.list_audit_events(event_type),
+        "chain": db.verify_audit_chain(),
+    }

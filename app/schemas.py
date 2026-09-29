@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 HeaderInput = Union[Dict[str, str], List[str]]
 
@@ -64,6 +64,35 @@ class ShadowVerifyRequest(VerifyRequest):
 class RegisterKeyRequest(BaseModel):
     keyid: str = Field(..., min_length=1, max_length=256)
     public_key: str = Field(..., description="PEM SPKI, base64 DER SPKI, or 32-byte raw Ed25519 (base64)")
+
+
+class ReceiptRevokeRequest(BaseModel):
+    """Idempotent admin command that revokes one acceptance receipt."""
+
+    reason: str = Field(
+        ...,
+        min_length=1,
+        max_length=1024,
+        description="Human-readable revocation reason (single line, signed into the record)",
+    )
+    effective_at: int = Field(
+        ...,
+        ge=0,
+        description="Unix seconds from which the revocation is effective; must not precede receipt issuance",
+    )
+    expected_revision: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="Optimistic-concurrency guard: receipt revision the admin saw (0 before revocation)",
+    )
+
+    @field_validator("reason")
+    @classmethod
+    def _single_line(cls, value: str) -> str:
+        reason = value.strip()
+        if not reason or "\n" in reason or "\r" in reason:
+            raise ValueError("reason must be a non-empty single-line string")
+        return reason
 
 
 class KeyInfo(BaseModel):

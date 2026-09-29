@@ -51,6 +51,13 @@ POLICY_DRAFT_NOT_ACTIVATABLE = "policy_draft_not_activatable"
 RECEIPT_UNKNOWN = "receipt_unknown"
 RECEIPT_ISSUANCE_FAILED = "receipt_issuance_failed"
 
+# Receipt revocation.
+RECEIPT_ALREADY_REVOKED = "receipt_already_revoked"
+REVOCATION_REVISION_CONFLICT = "revocation_revision_conflict"
+REVOCATION_CONFLICT = "revocation_conflict"
+REVOCATION_EFFECTIVE_BEFORE_ISSUANCE = "revocation_effective_before_issuance"
+REVOCATION_FAILED = "revocation_failed"
+
 # Internal.
 INTERNAL_ERROR = "internal_error"
 

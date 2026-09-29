@@ -13,6 +13,11 @@
    unaffected).
 7. Verify the acceptance receipt offline against the public keys published
    at GET /receipts/keys.
+8. Submit a second acceptance, revoke its receipt (idempotent command with
+   reason / effective_at / expected_revision), replay the command to show
+   idempotency, query the point-in-time state (valid / revoked / unknown)
+   and verify the signed revocation proof offline (tampering, time travel
+   and cross-receipt reuse all fail).
 
 Usage:
     python examples/demo_client.py [base_url] [admin_token]
@@ -23,6 +28,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 
 import httpx
 
@@ -137,6 +143,103 @@ def main() -> int:
         )
         print("offline check: python tools/verify_receipt.py --receipt r.json "
               "--keys keys.json [--request request.json]")
+
+    # 8. Revocation + point-in-time status ------------------------------------
+    second_body = {k: v for k, v in make_signed_request(
+        private_key=private_key,
+        algorithm="ed25519",
+        keyid=keyid,
+        method="POST",
+        target_uri="https://api.example.com/demo?x=2",
+        headers=[("content-type", "application/json")],
+        body=b'{"hello":"revoke"}',
+        components=["@method", "@target-uri", "@authority", "content-digest", "content-type"],
+    ).items() if not k.startswith("_")}
+    second = httpx.post(f"{base_url}/verify", json=second_body, timeout=10).json()
+    receipt2 = second["receipt"]
+    rid2 = receipt2["receipt_id"]
+
+    before = httpx.get(f"{base_url}/receipts/{rid2}/status", timeout=10).json()
+    print(f"\nstatus before revoke -> {before['status']}")
+
+    effective_at = int(time.time())
+    command = {
+        "reason": "demonstration revocation",
+        "effective_at": effective_at,
+        "expected_revision": 0,
+    }
+    r = httpx.post(
+        f"{base_url}/admin/receipts/{rid2}/revoke",
+        headers=admin_headers, json=command, timeout=10,
+    )
+    print("first  revoke ->", r.status_code)
+    revoked = r.json()
+    print(json.dumps(revoked, indent=2, ensure_ascii=False))
+
+    # Replay the identical command: idempotent, same immutable proof.
+    replay = httpx.post(
+        f"{base_url}/admin/receipts/{rid2}/revoke",
+        headers=admin_headers, json=command, timeout=10,
+    )
+    print(
+        f"replay revoke -> {replay.status_code} "
+        f"(idempotent={replay.json().get('idempotent')}, "
+        f"same proof={replay.json()['revocation']['revocation_id'] == revoked['revocation']['revocation_id']})"
+    )
+
+    # A conflicting command (different reason) is rejected.
+    conflict = httpx.post(
+        f"{base_url}/admin/receipts/{rid2}/revoke",
+        headers=admin_headers,
+        json={"reason": "different reason", "effective_at": effective_at,
+              "expected_revision": 0},
+        timeout=10,
+    )
+    print(f"conflict revoke -> {conflict.status_code} {conflict.json().get('reason')}")
+
+    # Point-in-time: valid before effective_at, revoked at/after it; unknown
+    # receipts report status "unknown".
+    st_valid = httpx.get(
+        f"{base_url}/receipts/{rid2}/status",
+        params={"at": effective_at - 1}, timeout=10,
+    ).json()
+    st_revoked = httpx.get(
+        f"{base_url}/receipts/{rid2}/status",
+        params={"at": effective_at}, timeout=10,
+    ).json()
+    st_unknown = httpx.get(
+        f"{base_url}/receipts/00000000-0000-0000-0000-000000000000/status",
+        timeout=10,
+    ).json()
+    print(
+        f"point-in-time: before={st_valid['status']}, "
+        f"at/after={st_revoked['status']}, unknown={st_unknown['status']}"
+    )
+
+    # Offline verification of the revocation proof (same published keys).
+    rev_proof = revoked["revocation"]
+    current_keys = httpx.get(f"{base_url}/receipts/keys", timeout=10).json()["keys"]
+    rev_entry = next(k for k in current_keys if k["key_id"] == rev_proof["key_id"])
+    rev_pub = load_public_key(rev_entry["public_key"])
+    rev_sig_ok = receipts.verify_payload_signature(
+        rev_pub, rev_proof["payload"], rev_proof["signature"]
+    )
+    rev_fields = receipts.parse_revocation_payload(rev_proof["payload"])
+    bound = (
+        rev_fields["receipt_id"] == rid2
+        and rev_fields["receipt_payload_sha256"]
+        == receipts.payload_sha256(receipt2["payload"])
+    )
+    print(
+        f"revocation {rev_fields['revocation_id']} (seq={rev_fields['sequence']}): "
+        f"signature {'OK' if rev_sig_ok else 'INVALID'}, "
+        f"receipt binding {'OK' if bound else 'MISMATCH'}"
+    )
+    print(
+        "offline revocation check:\n"
+        "  python tools/verify_receipt.py --status status.json --keys keys.json \\\n"
+        "      --expect-status revoked"
+    )
 
     return 0
 

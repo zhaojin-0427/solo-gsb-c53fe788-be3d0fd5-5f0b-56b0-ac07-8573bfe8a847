@@ -1,6 +1,7 @@
 """PostgreSQL access: schema, key registry, policy, replay protection, receipts."""
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 import uuid
@@ -33,6 +34,53 @@ class ReceiptIssuanceError(Exception):
     The caller's transaction — including the nonce claim — must roll back
     as a whole, so no acceptance state and no partial receipt survive.
     """
+
+
+class ReceiptNotFound(Exception):
+    """Raised when an admin command targets an unknown receipt id."""
+
+
+class ReceiptAlreadyRevoked(Exception):
+    """Raised when a non-idempotent revocation targets an already-revoked receipt."""
+
+    def __init__(self, receipt_id: str, revocation_id: str, revision: int):
+        super().__init__(f"receipt {receipt_id!r} is already revoked at revision {revision}")
+        self.receipt_id = receipt_id
+        self.revocation_id = revocation_id
+        self.revision = revision
+
+
+class RevocationRevisionConflict(Exception):
+    """Raised when expected_revision does not match the current revision."""
+
+    def __init__(self, receipt_id: str, expected: int, current: int):
+        super().__init__(
+            f"receipt {receipt_id!r} expected revision {expected} "
+            f"but current revision is {current}"
+        )
+        self.receipt_id = receipt_id
+        self.expected = expected
+        self.current = current
+
+
+class RevocationEffectiveBeforeIssuance(Exception):
+    """Raised when effective_at precedes the receipt's issuance time.
+
+    Such a command would rewrite history (time travel) and is rejected.
+    """
+
+    def __init__(self, receipt_id: str, effective_at: int, issued_at: int):
+        super().__init__(
+            f"revocation effective_at={effective_at} is before the receipt "
+            f"was issued at {issued_at}"
+        )
+        self.receipt_id = receipt_id
+        self.effective_at = effective_at
+        self.issued_at = issued_at
+
+
+class RevocationError(Exception):
+    """Raised when revocation signing/persistence fails (whole tx rolls back)."""
 
 
 class PolicyVersionNotFound(Exception):
@@ -175,7 +223,52 @@ CREATE TABLE IF NOT EXISTS receipts (
 CREATE INDEX IF NOT EXISTS receipts_issued_idx ON receipts (issued_at);
 CREATE INDEX IF NOT EXISTS receipts_signer_nonce_idx
     ON receipts (signer_keyid, nonce);
+
+-- Immutable, server-signed receipt revocation records.  Rows are append-only:
+-- a unique index allows at most one revocation per receipt; the global
+-- audit ``sequence`` is gapless and the signed payload binds to the exact
+-- receipt (id + receipt payload hash), so a revocation cannot be replayed
+-- onto another receipt or silently altered.
+CREATE TABLE IF NOT EXISTS receipt_revocations (
+    id                      BIGSERIAL PRIMARY KEY,
+    revocation_id           TEXT NOT NULL UNIQUE,
+    receipt_id              TEXT NOT NULL UNIQUE REFERENCES receipts(receipt_id),
+    sequence                BIGINT NOT NULL UNIQUE,
+    revision                INTEGER NOT NULL,
+    key_id                  TEXT NOT NULL,
+    payload                 TEXT NOT NULL,
+    signature               TEXT NOT NULL,
+    receipt_payload_sha256  TEXT NOT NULL,
+    reason                  TEXT NOT NULL,
+    effective_at            TIMESTAMPTZ NOT NULL,
+    revoked_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Tamper-evident, gapless audit chain.  Every state-changing admin event
+-- (currently: receipt revocation) is appended in the SAME transaction as
+-- the change it records; each row commits the hash of its predecessor, so
+-- any deleted or altered row is detectable by recomputing the chain.
+CREATE TABLE IF NOT EXISTS audit_events (
+    seq          BIGSERIAL PRIMARY KEY,
+    event_type   TEXT NOT NULL,
+    event_id     TEXT NOT NULL,
+    receipt_id   TEXT,
+    canonical    TEXT NOT NULL,
+    entry_sha256 TEXT NOT NULL,
+    prev_sha256  TEXT NOT NULL,
+    receipt_payload_sha256     TEXT,
+    revocation_payload_sha256  TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- Idempotent upgrade for databases created before the hash columns existed.
+ALTER TABLE audit_events
+    ADD COLUMN IF NOT EXISTS receipt_payload_sha256 TEXT,
+    ADD COLUMN IF NOT EXISTS revocation_payload_sha256 TEXT;
 """
+
+#: Genesis predecessor hash for the first audit chain entry.
+AUDIT_GENESIS_PREV = "0" * 64
 
 DEFAULT_POLICY: Dict[str, Any] = {
     "required_components": list(config.DEFAULT_REQUIRED_COMPONENTS),
@@ -1034,3 +1127,386 @@ def get_receipt(receipt_id: str) -> Optional[Dict[str, Any]]:
     return receipts.receipt_document(
         payload=row[0], signature=row[1], issued_at=row[2].isoformat()
     )
+
+
+# ---------------------------------------------------------------------------
+# Tamper-evident audit chain
+#
+# Append-only, gapless, hash-chained.  Each entry's canonical text embeds
+# the predecessor hash; the chain and the state changes it describes commit
+# in the SAME transaction, so a revocation without its audit entry (or vice
+# versa) can never survive a commit.  Nothing ever UPDATEs or DELETEs here.
+# ---------------------------------------------------------------------------
+
+AUDIT_CANONICAL_VERSION = "audit-entry/v1"
+
+
+def audit_canonical(
+    *,
+    seq: int,
+    event_type: str,
+    event_id: str,
+    receipt_id: Optional[str],
+    prev_sha256: str,
+    receipt_payload_sha256: Optional[str] = None,
+    revocation_payload_sha256: Optional[str] = None,
+) -> str:
+    """Deterministic canonical text of one audit chain entry."""
+    lines = [
+        AUDIT_CANONICAL_VERSION,
+        f"seq: {int(seq)}",
+        f"event_type: {event_type}",
+        f"event_id: {event_id}",
+        f"receipt_id: {receipt_id or ''}",
+        f"prev_sha256: {prev_sha256}",
+    ]
+    if revocation_payload_sha256 is not None:
+        lines.append(f"revocation_payload_sha256: {revocation_payload_sha256}")
+    if receipt_payload_sha256 is not None:
+        lines.append(f"receipt_payload_sha256: {receipt_payload_sha256}")
+    return "\n".join(lines)
+
+
+def _append_audit_event(
+    cur,
+    *,
+    event_type: str,
+    event_id: str,
+    receipt_id: Optional[str],
+    receipt_payload_sha256: Optional[str] = None,
+    revocation_payload_sha256: Optional[str] = None,
+) -> int:
+    """Append one hash-chained audit entry inside the caller's transaction.
+
+    A global advisory lock serialises writers; sequence numbers are derived
+    from the previous row (not a SEQUENCE object), so the committed chain
+    is gapless.  Returns the assigned sequence number.
+    """
+    cur.execute("SELECT pg_advisory_xact_lock(hashtextextended('audit_chain', 0))")
+    cur.execute("SELECT seq, entry_sha256 FROM audit_events ORDER BY seq DESC LIMIT 1")
+    last = cur.fetchone()
+    seq = (last[0] + 1) if last else 1
+    prev_sha256 = last[1] if last else AUDIT_GENESIS_PREV
+    canonical = audit_canonical(
+        seq=seq,
+        event_type=event_type,
+        event_id=event_id,
+        receipt_id=receipt_id,
+        prev_sha256=prev_sha256,
+        receipt_payload_sha256=receipt_payload_sha256,
+        revocation_payload_sha256=revocation_payload_sha256,
+    )
+    entry_sha256 = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    cur.execute(
+        """
+        INSERT INTO audit_events (
+            seq, event_type, event_id, receipt_id,
+            canonical, entry_sha256, prev_sha256,
+            receipt_payload_sha256, revocation_payload_sha256
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            seq,
+            event_type,
+            event_id,
+            receipt_id,
+            canonical,
+            entry_sha256,
+            prev_sha256,
+            receipt_payload_sha256,
+            revocation_payload_sha256,
+        ),
+    )
+    return seq
+
+
+def list_audit_events(event_type: Optional[str] = None) -> list:
+    """List audit chain entries in sequence order (admin only)."""
+    with transaction(read_only=True) as cur:
+        if event_type:
+            cur.execute(
+                "SELECT seq, event_type, event_id, receipt_id, entry_sha256, "
+                "prev_sha256, created_at FROM audit_events "
+                "WHERE event_type = %s ORDER BY seq",
+                (event_type,),
+            )
+        else:
+            cur.execute(
+                "SELECT seq, event_type, event_id, receipt_id, entry_sha256, "
+                "prev_sha256, created_at FROM audit_events ORDER BY seq"
+            )
+        return [
+            {
+                "seq": r[0],
+                "event_type": r[1],
+                "event_id": r[2],
+                "receipt_id": r[3],
+                "entry_sha256": r[4],
+                "prev_sha256": r[5],
+                "created_at": r[6].isoformat() if r[6] else None,
+            }
+            for r in cur.fetchall()
+        ]
+
+
+def verify_audit_chain(cur=None) -> Dict[str, Any]:
+    """Recompute the whole audit chain and report the first broken link.
+
+    Reads only.  ``first_bad_seq`` is null when every link is intact.
+    """
+
+    def _check(c):
+        c.execute(
+            "SELECT seq, event_type, event_id, receipt_id, canonical, "
+            "entry_sha256, prev_sha256, receipt_payload_sha256, "
+            "revocation_payload_sha256 FROM audit_events ORDER BY seq"
+        )
+        rows = c.fetchall()
+        prev = AUDIT_GENESIS_PREV
+        expected_seq = 1
+        first_bad = None
+        for r in rows:
+            (
+                seq,
+                event_type,
+                event_id,
+                receipt_id,
+                canonical,
+                entry,
+                stored_prev,
+                receipt_hash,
+                revocation_hash,
+            ) = r
+            # Rebuild the canonical text from the plain columns: tampering
+            # with event_id/receipt_id/hashes (or canonical itself) is caught.
+            rebuilt = audit_canonical(
+                seq=seq,
+                event_type=event_type,
+                event_id=event_id,
+                receipt_id=receipt_id,
+                prev_sha256=stored_prev,
+                receipt_payload_sha256=receipt_hash,
+                revocation_payload_sha256=revocation_hash,
+            )
+            recomputed_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+            intact = (
+                first_bad is None
+                and seq == expected_seq
+                and stored_prev == prev
+                and rebuilt == canonical
+                and entry == recomputed_hash
+            )
+            if not intact and first_bad is None:
+                first_bad = seq
+            prev = entry
+            expected_seq += 1
+        return {
+            "ok": first_bad is None,
+            "entries": len(rows),
+            "first_bad_seq": first_bad,
+        }
+
+    if cur is not None:
+        return _check(cur)
+    with transaction(read_only=True) as c:
+        return _check(c)
+
+
+# ---------------------------------------------------------------------------
+# Receipt revocation — idempotent, optimistic-revision checked, immutable.
+#
+# ``POST /admin/receipts/{receipt_id}/revoke`` runs entirely in one
+# transaction:
+#
+#   1. a global advisory lock serialises audit-chain appends;
+#   2. the target receipt row is locked (``SELECT ... FOR UPDATE``);
+#   3. unknown receipts are rejected (404 receipt_unknown);
+#   4. an existing revocation makes the command either an idempotent replay
+#      (same reason + effective_at -> 200, identical proof) or a conflict
+#      (different command -> 409 receipt_already_revoked);
+#   5. ``expected_revision`` (optimistic concurrency) must match: a fresh
+#      receipt is at revision 0;
+#   6. ``effective_at`` must not precede receipt issuance (no rewriting
+#      history / time travel);
+#   7. the immutable, sequenced, server-signed revocation record and the
+#      audit-chain entry are inserted together and commit atomically.
+# ---------------------------------------------------------------------------
+
+
+_REVOCATION_SELECT = """
+    SELECT revocation_id, key_id, payload, signature, receipt_payload_sha256,
+           reason, effective_at, revoked_at, sequence, revision
+    FROM receipt_revocations
+"""
+
+
+def _revocation_row_to_doc(r) -> Dict[str, Any]:
+    # Column order matches _REVOCATION_SELECT.
+    return receipts.revocation_document(payload=r[2], signature=r[3])
+
+
+def _get_revocation(cur, receipt_id: str):
+    cur.execute(_REVOCATION_SELECT + " WHERE receipt_id = %s", (receipt_id,))
+    return cur.fetchone()
+
+
+def revoke_receipt(
+    *,
+    receipt_id: str,
+    reason: str,
+    effective_at: int,
+    expected_revision: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Idempotently revoke an acceptance receipt (single atomic transaction).
+
+    Returns ``{"revocation": <signed proof document>, "idempotent": bool}``.
+    Raises ``ReceiptNotFound``, ``ReceiptAlreadyRevoked``,
+    ``RevocationRevisionConflict``, ``RevocationEffectiveBeforeIssuance``
+    or ``RevocationError``.
+    """
+    with transaction() as cur:
+        # Serialise chain writers, then lock exactly this receipt row.
+        cur.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended('audit_chain', 0))"
+        )
+        cur.execute(
+            "SELECT payload, signature, issued_at FROM receipts "
+            "WHERE receipt_id = %s FOR UPDATE",
+            (receipt_id,),
+        )
+        receipt_row = cur.fetchone()
+        if receipt_row is None:
+            raise ReceiptNotFound(receipt_id)
+        receipt_payload, receipt_signature, issued_dt = receipt_row
+        issued_ts = int(issued_dt.timestamp())
+
+        existing = _get_revocation(cur, receipt_id)
+        if existing is not None:
+            doc = _revocation_row_to_doc(existing)
+            same_command = (
+                existing[5] == reason
+                and int(existing[6].timestamp()) == int(effective_at)
+            )
+            if same_command:
+                # Idempotent replay: return the exact same immutable proof.
+                return {"revocation": doc, "idempotent": True}
+            raise ReceiptAlreadyRevoked(receipt_id, existing[0], existing[9])
+
+        # Fresh receipt: current revision is 0.
+        if expected_revision is not None and expected_revision != 0:
+            raise RevocationRevisionConflict(receipt_id, expected_revision, 0)
+
+        if int(effective_at) < issued_ts:
+            raise RevocationEffectiveBeforeIssuance(
+                receipt_id, int(effective_at), issued_ts
+            )
+
+        try:
+            key = ensure_receipt_signing_key(cur)
+            private_key = load_private_key(key["private_key"])
+            receipt_hash = receipts.payload_sha256(receipt_payload)
+            revocation_id = str(uuid.uuid4())
+            revoked_dt = datetime.now(timezone.utc)
+            revoked_ts = int(revoked_dt.timestamp())
+            effective_dt = datetime.fromtimestamp(int(effective_at), tz=timezone.utc)
+
+            # Reserve the global audit sequence under the advisory lock:
+            # the sequence is part of the signed revocation payload, and
+            # the audit entry appended below must get the same number.
+            cur.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM audit_events"
+            )
+            sequence = cur.fetchone()[0]
+            payload = receipts.build_revocation_payload(
+                revocation_id=revocation_id,
+                key_id=key["key_id"],
+                receipt_id=receipt_id,
+                sequence=sequence,
+                revision=1,
+                receipt_payload_sha256=receipt_hash,
+                reason=reason,
+                effective_at=int(effective_at),
+                revoked_at=revoked_ts,
+            )
+            signature = receipts.sign_payload(private_key, payload)
+            revocation_hash = receipts.payload_sha256(payload)
+
+            audit_seq = _append_audit_event(
+                cur,
+                event_type="receipt_revoked",
+                event_id=revocation_id,
+                receipt_id=receipt_id,
+                receipt_payload_sha256=receipt_hash,
+                revocation_payload_sha256=revocation_hash,
+            )
+            if audit_seq != sequence:  # pragma: no cover - lock makes this impossible
+                raise RevocationError("audit sequence allocation was inconsistent")
+
+            cur.execute(
+                """
+                INSERT INTO receipt_revocations (
+                    revocation_id, receipt_id, sequence, revision, key_id,
+                    payload, signature, receipt_payload_sha256,
+                    reason, effective_at, revoked_at
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    revocation_id,
+                    receipt_id,
+                    sequence,
+                    1,
+                    key["key_id"],
+                    payload,
+                    signature,
+                    receipt_hash,
+                    reason,
+                    effective_dt,
+                    revoked_dt,
+                ),
+            )
+        except (RevocationError, receipts.ReceiptFormatError):
+            raise
+        except Exception as exc:
+            raise RevocationError(f"could not persist revocation: {exc}") from exc
+
+        return {"revocation": receipts.revocation_document(
+            payload=payload, signature=signature
+        ), "idempotent": False}
+
+
+def get_receipt_status(receipt_id: str, at_ts: int) -> Optional[Dict[str, Any]]:
+    """Point-in-time receipt state: ``valid``, ``revoked`` or ``None`` (unknown).
+
+    A receipt counts as revoked at ``at_ts`` only when a persisted
+    revocation is effective at or before that instant; a revocation with a
+    later ``effective_at`` leaves the receipt valid at the queried time.
+    """
+    with transaction(read_only=True) as cur:
+        cur.execute(
+            "SELECT payload, signature, issued_at FROM receipts WHERE receipt_id = %s",
+            (receipt_id,),
+        )
+        receipt_row = cur.fetchone()
+        if receipt_row is None:
+            return None
+        receipt = receipts.receipt_document(
+            payload=receipt_row[0],
+            signature=receipt_row[1],
+            issued_at=receipt_row[2].isoformat(),
+        )
+        rev_row = _get_revocation(cur, receipt_id)
+        revocation = None
+        status = "valid"
+        if rev_row is not None:
+            effective_ts = int(rev_row[6].timestamp())
+            if at_ts >= effective_ts:
+                status = "revoked"
+            revocation = _revocation_row_to_doc(rev_row)
+        return {
+            "receipt_id": receipt_id,
+            "status": status,
+            "at": at_ts,
+            "issued_at_unix": receipt["issued_at_unix"],
+            "receipt": receipt,
+            "revocation": revocation,
+        }
