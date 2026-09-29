@@ -1,0 +1,6 @@
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+http-sfv==0.9.9
+cryptography==50.0.1
+psycopg2-binary==2.9.13
+pydantic==2.13.5
